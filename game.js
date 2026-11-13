@@ -1,19 +1,21 @@
 import * as THREE from 'three';
 import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
 import { SCHEMA, DEFAULTS } from './config.js';
+import { createTray } from './tray.js';
 
 const ICONS = ['🏮', '💰', '🎭', '🐼', '🐉', '🏺', '🌸', '🦁', '🍵', '🏯', '🧧', '🎋', '🐟', '🎏', '🪭', '🀄'];
 const LAYOUT_KEYS = new Set(['seed', 'tileTypes', 'tripletCount', 'layers', 'boardCols', 'boardRows', 'trayCapacity']);
 const MESH_KEYS = new Set(['tileWidth', 'tileThickness', 'bevel', 'gap', 'layerOffset', 'jitter', 'iconScale', 'tileColor', 'sideColor', 'roughness', 'metalness', 'clearcoat']);
+const TRAY_KEYS = new Set(['trayX', 'trayY', 'trayZ', 'trayWidth', 'trayDepth', 'trayThickness', 'trayPadding', 'trayRound', 'trayTileScale', 'trayColor', 'slotColor']);
 const LIGHT_KEYS = new Set(['ambient', 'sun', 'sunX', 'sunY', 'sunZ', 'shadows', 'shadowSoft']);
 const CAMERA_KEYS = new Set(['fov', 'camHeight', 'camDistance', 'camTilt']);
-const BG_KEYS = new Set(['skyTop', 'skyBottom', 'groundColor', 'trayColor', 'fogDensity']);
+const BG_KEYS = new Set(['skyTop', 'skyBottom', 'groundColor', 'fogDensity']);
+const ASSET_KEYS = new Set(['bgImage', 'iconPaths']);
 const NODE_LIMIT = 60000;
 const SOLVE_LIMIT = Symbol('solve-limit');
 
 const params = { ...DEFAULTS };
 const statusEl = document.getElementById('status');
-const trayEl = document.getElementById('tray');
 const panelEl = document.getElementById('panel');
 
 function setStatus(text) {
@@ -158,10 +160,9 @@ sun.shadow.bias = -0.0005;
 Object.assign(sun.shadow.camera, { left: -14, right: 14, top: 14, bottom: -14, near: 1, far: 80 });
 scene.add(ambient, sun, sun.target);
 
-const ground = new THREE.Mesh(
-  new THREE.PlaneGeometry(120, 120),
-  new THREE.MeshStandardMaterial({ color: params.groundColor })
-);
+const groundMat = new THREE.MeshStandardMaterial({ color: params.groundColor });
+const groundShadowMat = new THREE.ShadowMaterial({ opacity: 0.2 });
+const ground = new THREE.Mesh(new THREE.PlaneGeometry(120, 120), groundMat);
 ground.rotation.x = -Math.PI / 2;
 ground.position.y = -0.02;
 ground.receiveShadow = true;
@@ -169,11 +170,8 @@ scene.add(ground);
 
 const raycaster = new THREE.Raycaster();
 const pointer = new THREE.Vector2();
-const tweens = [];
-const particles = [];
 let level = null;
 let heights = [];
-let tray = [];
 let onBoard = 0;
 let busy = false;
 let autoRunning = false;
@@ -181,6 +179,7 @@ let gameOver = false;
 let ownedRes = [];
 let boardMeshes = [];
 let audioCtx = null;
+const tray = createTray(scene, params, (freq, dur, vol) => playTone(freq, dur, vol));
 
 function applyLights() {
   ambient.intensity = params.ambient;
@@ -204,9 +203,13 @@ function applyCamera() {
 }
 
 function applyBackground() {
-  document.body.style.background = `linear-gradient(${params.skyTop}, ${params.skyBottom})`;
-  ground.material.color.set(params.groundColor);
-  trayEl.style.background = params.trayColor;
+  const sky = `linear-gradient(${params.skyTop}, ${params.skyBottom})`;
+  const hasImg = Boolean(params.bgImage);
+  document.body.style.background = hasImg
+    ? `url("${params.bgImage.replaceAll('"', '%22')}") center / cover no-repeat`
+    : sky;
+  ground.material = hasImg ? groundShadowMat : groundMat;
+  groundMat.color.set(params.groundColor);
   scene.fog = new THREE.FogExp2(params.skyBottom, params.fogDensity);
 }
 
@@ -227,11 +230,40 @@ function iconTexture(emoji, bg, scale) {
   return tex;
 }
 
+let buildGen = 0;
+const imgCache = new Map();
+
 function clearBoard() {
+  buildGen++;
   for (const mesh of boardMeshes) scene.remove(mesh);
   boardMeshes = [];
   for (const r of ownedRes) r.dispose();
   ownedRes = [];
+}
+
+// 第 N 行对应第 N 种图案;空行表示使用默认 emoji。
+function iconSources() {
+  return params.iconPaths.split('\n').map((s) => s.trim());
+}
+
+function loadTexture(src, mat) {
+  const gen = buildGen;
+  const apply = (tex) => {
+    mat.map = tex;
+    mat.needsUpdate = true;
+  };
+  if (imgCache.has(src)) return apply(imgCache.get(src));
+  new THREE.TextureLoader().load(
+    src,
+    (tex) => {
+      tex.colorSpace = THREE.SRGBColorSpace;
+      tex.anisotropy = 4;
+      imgCache.set(src, tex);
+      if (gen === buildGen) apply(tex);
+    },
+    undefined,
+    () => setStatus(`图案加载失败:${src.slice(0, 80)}`)
+  );
 }
 
 function rebuildMeshes() {
@@ -248,15 +280,19 @@ function rebuildMeshes() {
     metalness: params.metalness,
     clearcoat: params.clearcoat,
   });
-  const topMats = ICONS.slice(0, params.tileTypes).map(
-    (emoji) =>
-      new THREE.MeshPhysicalMaterial({
-        map: iconTexture(emoji, params.tileColor, params.iconScale),
-        roughness: params.roughness,
-        metalness: params.metalness,
-        clearcoat: params.clearcoat,
-      })
-  );
+  const topMats = ICONS.slice(0, params.tileTypes).map((emoji, type) => {
+    const map = iconTexture(emoji, params.tileColor, params.iconScale);
+    ownedRes.push(map);
+    const mat = new THREE.MeshPhysicalMaterial({
+      map,
+      roughness: params.roughness,
+      metalness: params.metalness,
+      clearcoat: params.clearcoat,
+    });
+    const src = iconSources()[type];
+    if (src) loadTexture(src, mat);
+    return mat;
+  });
   ownedRes.push(geo, sideMat, ...topMats);
 
   for (const tile of level.tiles) {
@@ -277,6 +313,8 @@ function rebuildMeshes() {
     scene.add(mesh);
     boardMeshes.push(mesh);
   }
+  tray.setAssets(geo, sideMat, topMats);
+  tray.rebuild();
 }
 
 function playTone(freq, dur, vol = 1) {
@@ -292,50 +330,23 @@ function playTone(freq, dur, vol = 1) {
   osc.stop(audioCtx.currentTime + dur);
 }
 
-function spawnParticles(pos, type) {
-  const count = params.matchEffect ? params.particleCount : 0;
-  const geo = new THREE.BoxGeometry(0.14, 0.14, 0.14);
-  for (let i = 0; i < count; i++) {
-    const mat = new THREE.MeshBasicMaterial({ color: new THREE.Color().setHSL((type / ICONS.length + Math.random() * 0.1) % 1, 0.8, 0.6) });
-    const mesh = new THREE.Mesh(geo, mat);
-    mesh.position.copy(pos);
-    scene.add(mesh);
-    particles.push({
-      mesh,
-      v: new THREE.Vector3((Math.random() - 0.5) * 6, 3 + Math.random() * 4, (Math.random() - 0.5) * 6),
-      life: 0.9,
-    });
-  }
-}
-
-function renderTray() {
-  trayEl.innerHTML = '';
-  for (let i = 0; i < params.trayCapacity; i++) {
-    const slot = document.createElement('div');
-    slot.className = 'slot';
-    if (tray[i] !== undefined) slot.textContent = ICONS[tray[i]];
-    trayEl.appendChild(slot);
-  }
-}
-
 function topTile(cell) {
   return level.stacks[cell][heights[cell] - 1];
 }
 
-function resolveTray(pos, type) {
-  if (tray.filter((t) => t === type).length === 3) {
-    tray = tray.filter((t) => t !== type);
-    spawnParticles(pos, type);
-    playTone(880, 0.18, 1.2);
-  }
-  if (tray.length > params.trayCapacity) {
-    gameOver = true;
-    autoRunning = false;
-    setStatus('收纳槽已满,失败。点"重新生成关卡"再来一局。');
-  } else if (onBoard === 0 && tray.length === 0) {
-    setStatus('通关!');
-  }
-  renderTray();
+function onArrive(type) {
+  const settle = () => {
+    if (tray.count() > params.trayCapacity) {
+      gameOver = true;
+      autoRunning = false;
+      setStatus('收纳槽已满,失败。点"重新生成关卡"再来一局。');
+    } else if (onBoard === 0 && tray.count() === 0) {
+      setStatus('通关!');
+    }
+    busy = false;
+  };
+  if (tray.countOf(type) === 3) tray.matchTriple(type, settle);
+  else settle();
 }
 
 function takeTile(tile) {
@@ -343,23 +354,10 @@ function takeTile(tile) {
   heights[tile.cell]--;
   tile.removed = true;
   onBoard--;
+  const idx = boardMeshes.indexOf(tile.mesh);
+  if (idx >= 0) boardMeshes.splice(idx, 1);
   playTone(520, 0.08);
-  const mesh = tile.mesh;
-  const from = mesh.position.clone();
-  const to = from.clone().add(new THREE.Vector3(0, 6, 0));
-  tweens.push({
-    mesh,
-    from,
-    to,
-    t0: performance.now(),
-    dur: Math.max(1, params.moveDuration),
-    done: () => {
-      scene.remove(mesh);
-      tray.push(tile.type);
-      busy = false;
-      resolveTray(to, tile.type);
-    },
-  });
+  tray.fly(tile.mesh, tile.type, () => onArrive(tile.type));
 }
 
 function onPointerDown(event) {
@@ -382,7 +380,7 @@ function onPointerDown(event) {
 function newLevel() {
   autoRunning = false;
   gameOver = false;
-  tray = [];
+  tray.clear();
   let found = null;
   for (let k = 0; k < 30 && !found; k++) {
     const seed = params.seed + k;
@@ -394,7 +392,6 @@ function newLevel() {
     level = null;
     clearBoard();
     setStatus('未找到可解布局。请增大收纳槽、减少层数或三连组数量后重试。');
-    renderTray();
     return;
   }
   level = found.layout;
@@ -403,14 +400,13 @@ function newLevel() {
   onBoard = level.tiles.length;
   rebuildMeshes();
   applyLights();
-  renderTray();
   const note = found.seed === params.seed ? '' : `(种子 ${params.seed} 不可解,改用 ${found.seed})`;
   setStatus(`关卡已生成${note},共 ${onBoard} 张牌,已验证可解。`);
 }
 
 function startAuto() {
   if (!level || gameOver) return;
-  if (tray.length || onBoard !== level.tiles.length) {
+  if (tray.count() || onBoard !== level.tiles.length) {
     setStatus('自动解谜需要从头开始,请先点"重新生成关卡"。');
     return;
   }
@@ -474,18 +470,78 @@ function resetParams() {
   newLevel();
 }
 
+function readAsDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(file);
+  });
+}
+
+// 选择的图片转为 data URL 写入参数,导出 JSON 后可以原样保存和复用。
+function pickImages(multiple, onPicked) {
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = 'image/*';
+  input.multiple = multiple;
+  input.onchange = async () => {
+    const files = [...input.files];
+    if (!files.length) return;
+    try {
+      onPicked(await Promise.all(files.map(readAsDataUrl)));
+    } catch {
+      setStatus('读取图片失败。');
+    }
+  };
+  input.click();
+}
+
+function pickBgFile() {
+  pickImages(false, ([url]) => {
+    setParam('bgImage', url);
+    buildPanel();
+    setStatus('已设置背景图。');
+  });
+}
+
+function pickIconFiles() {
+  pickImages(true, (urls) => {
+    const lines = iconSources();
+    urls.forEach((url, i) => {
+      lines[i] = url;
+    });
+    setParam('iconPaths', lines.join('\n'));
+    buildPanel();
+    setStatus(`已设置 ${urls.length} 个图案。`);
+  });
+}
+
+function clearAssets() {
+  params.bgImage = '';
+  params.iconPaths = '';
+  imgCache.clear();
+  applyBackground();
+  rebuildMeshes();
+  buildPanel();
+}
+
 const ACTIONS = {
   regenerate: () => newLevel(),
   autoSolve: () => startAuto(),
   exportJson: exportParams,
   importJson: importParams,
   resetDefaults: resetParams,
+  pickBgFile: () => pickBgFile(),
+  pickIconFiles: () => pickIconFiles(),
+  clearAssets,
 };
 
 function applyAll() {
   applyBackground();
   applyCamera();
   applyLights();
+  tray.applyColors();
   rebuildMeshes();
 }
 
@@ -497,12 +553,18 @@ function setParam(key, value) {
     layoutTimer = setTimeout(newLevel, 250);
   } else if (MESH_KEYS.has(key)) {
     rebuildMeshes();
+  } else if (TRAY_KEYS.has(key)) {
+    tray.applyColors();
+    tray.rebuild();
   } else if (LIGHT_KEYS.has(key)) {
     applyLights();
   } else if (CAMERA_KEYS.has(key)) {
     applyCamera();
   } else if (BG_KEYS.has(key)) {
     applyBackground();
+  } else if (ASSET_KEYS.has(key)) {
+    applyBackground();
+    if (key === 'iconPaths') rebuildMeshes();
   }
 }
 
@@ -552,6 +614,13 @@ function buildPanel() {
         input.checked = params[item.key];
         input.onchange = () => setParam(item.key, input.checked);
         row.appendChild(input);
+      } else if (item.type === 'text') {
+        const input = document.createElement(item.multiline ? 'textarea' : 'input');
+        if (!item.multiline) input.type = 'text';
+        input.placeholder = item.multiline ? '每行一个图片网址或路径' : '网址或 data:image/...';
+        input.value = params[item.key];
+        input.onchange = () => setParam(item.key, item.multiline ? input.value : input.value.trim());
+        row.replaceChildren(label, input);
       }
       section.appendChild(row);
     }
@@ -572,31 +641,7 @@ function frame(now) {
   const dt = Math.min(0.05, (now - last) / 1000);
   last = now;
 
-  for (let i = tweens.length - 1; i >= 0; i--) {
-    const tw = tweens[i];
-    const k = Math.min(1, (now - tw.t0) / tw.dur);
-    const e = k * k * (3 - 2 * k);
-    tw.mesh.position.lerpVectors(tw.from, tw.to, e);
-    tw.mesh.scale.setScalar(1 - e * 0.9);
-    if (k >= 1) {
-      tweens.splice(i, 1);
-      tw.done();
-    }
-  }
-
-  for (let i = particles.length - 1; i >= 0; i--) {
-    const p = particles[i];
-    p.life -= dt;
-    p.v.y -= 9 * dt;
-    p.mesh.position.addScaledVector(p.v, dt);
-    p.mesh.rotation.x += dt * 6;
-    if (p.life <= 0) {
-      scene.remove(p.mesh);
-      p.mesh.material.dispose();
-      particles.splice(i, 1);
-    }
-  }
-
+  tray.update(now, dt);
   renderer.render(scene, camera);
 }
 
